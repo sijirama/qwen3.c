@@ -62,7 +62,7 @@ struct Qwen3Model {
     void *mmap_base;
     size_t mmap_size;
 
-    struct GGUFHeader *header;
+    struct GGUFHeader header;
     struct Qwen3Config config;
     struct Qwen3Layer *layers;
 };
@@ -421,6 +421,11 @@ bool read_gguf_tensor_infos(FILE *file, const struct GGUFHeader *header,
     return true;
 }
 
+bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
+                    uint64_t tensor_data_start, struct Qwen3Model *model) {
+    return true;
+}
+
 int main(int argc, char **argv) {
 
     if(argc < 2) {
@@ -451,6 +456,54 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    struct GGUFTensorInfo *infos = NULL;
+
+    if(!read_gguf_tensor_infos(file, &header, &infos)) {
+        fprintf(stderr, "Failed to parse tensor descriptors\n");
+        fclose(file);
+        return 1;
+    }
+
+    // INFO: GGUF normally aligns the beginning of the tensor-data section to a
+    // 32-byte boundary (unless metadata specifies another alignment).
+
+    // assume that the current offset just after reading the tensors desriptions
+    // is not aligned the gguf's 32 byte alignement
+
+    long position = ftell(file);
+
+    if(position < 0) {
+        perror("ftell");
+        // handle cleanup
+        return 1;
+    }
+
+    uint64_t alignment = 32; // GGUF default
+    uint64_t offset = (uint64_t)position;
+
+    uint64_t tensor_data_start =
+        offset + (alignment - (offset % alignment)) % alignment;
+
+    struct Qwen3Model *model = malloc(sizeof(struct Qwen3Model));
+
+    if(!model) {
+        // TODO: lol handle allocation failure
+        return 1;
+    }
+
+    model->header = header;
+    model->config = config;
+
+    if(!qwen3_map_file(argv[1], infos, tensor_data_start, model)) {
+        fprintf(stderr, "Failed to mmap the model file\n");
+        free(infos);
+        free(model);
+        fclose(file);
+        return 1;
+    }
+
+    // NOTE: print model data basically
+
     printf("GGUF version: %u\n", header.version);
     printf("Tensor count: %llu\n", (unsigned long long)header.tensor_count);
     printf("Layers: %u\n", config.num_layers);
@@ -460,19 +513,13 @@ int main(int argc, char **argv) {
     printf("Head dimension: %u\n", config.head_dim);
     printf("Context length: %u\n", config.context_length);
 
-    struct GGUFTensorInfo *infos = NULL;
-
-    if(!read_gguf_tensor_infos(file, &header, &infos)) {
-        fprintf(stderr, "Failed to parse tensor descriptors\n");
-        fclose(file);
-        return 1;
-    }
-
     for(uint64_t i = 0; i < header.tensor_count; i++) {
         printf("%s | ndim=%u | type=%u | offset=%llu\n", infos[i].name,
                infos[i].ndim, infos[i].type,
                (unsigned long long)infos[i].offset);
     }
+
+    // NOTE: free pointers
 
     for(uint64_t i = 0; i < header.tensor_count; i++)
         free(infos[i].name);
