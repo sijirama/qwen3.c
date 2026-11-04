@@ -74,7 +74,7 @@ struct Qwen3Model {
 };
 
 // ============================================================
-// GGUF METADATA PARSER
+// GGUF MODEL FILE PARSER
 // ============================================================
 
 enum {
@@ -585,6 +585,10 @@ fail_mapped:
         fclose(file);
     return false;
 }
+
+// ============================================================
+// TOKENIZER
+// ============================================================
 
 void destroy_model(struct Qwen3Model *model) {
     if(!model)
