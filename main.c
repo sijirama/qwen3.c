@@ -600,7 +600,6 @@ void destroy_model(struct Qwen3Model *model) {
     }
 }
 
-#ifndef QWEN3_TEST
 int main(int argc, char **argv) {
 
     if(argc < 2) {
@@ -691,4 +690,3 @@ int main(int argc, char **argv) {
     free(model);
     return 0;
 }
-#endif
