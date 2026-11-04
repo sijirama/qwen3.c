@@ -3,13 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-struct Tensor {
-    const void *data;
-    int64_t shape[4];
-    int ndim;
-    int type;
-};
+#include <sys/mman.h>
 
 struct GGUFTensorInfo {
     char *name;
@@ -40,6 +34,13 @@ struct Qwen3Config {
     float rms_norm_eps;
 };
 
+struct Tensor {
+    const void *data;
+    int64_t shape[4];
+    int ndim;
+    int type;
+};
+
 struct Qwen3Layer {
     struct Tensor attn_q;
     struct Tensor attn_k;
@@ -65,6 +66,10 @@ struct Qwen3Model {
     struct GGUFHeader header;
     struct Qwen3Config config;
     struct Qwen3Layer *layers;
+
+    struct Tensor output_norm;
+    struct Tensor token_embedding;
+    struct Tensor output;
 };
 
 // ============================================================
@@ -423,6 +428,84 @@ bool read_gguf_tensor_infos(FILE *file, const struct GGUFHeader *header,
 
 bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
                     uint64_t tensor_data_start, struct Qwen3Model *model) {
+
+    FILE *file = fopen(path, "rb");
+    if(!file) {
+        return false;
+    }
+
+    int fd = fileno(file);
+    if(fd == -1) {
+        fclose(file);
+        return false;
+    }
+
+    if(fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    long file_size = ftell(file);
+    if(file_size == -1) {
+        fclose(file);
+        return false;
+    }
+
+    if(fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    void *base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if(base == MAP_FAILED) {
+        fclose(file);
+        return false;
+    }
+
+    model->mmap_base = base;
+    model->mmap_size = file_size;
+
+    // INFO: start mapping tensors;
+
+    uint64_t temp = 0;
+    uint64_t tensor_idx = 0;
+
+    // INFO: output_norm.weight is the first tensor in the tensor info array
+    struct Tensor output_norm = {.ndim = infos[0].ndim,
+                                 .type = infos[0].type,
+                                 .data = (const uint8_t *)model->mmap_base +
+                                         tensor_data_start + infos[0].offset};
+    memcpy(output_norm.shape, infos[0].shape, sizeof(infos[0].shape));
+
+    // INFO: token_embed.weight is the second tensor in the tensor info array
+    struct Tensor token_embedding = {.ndim = infos[1].ndim,
+                                     .type = infos[1].type,
+                                     .data = (const uint8_t *)model->mmap_base +
+                                             tensor_data_start +
+                                             infos[1].offset};
+    memcpy(token_embedding.shape, infos[1].shape, sizeof(infos[1].shape));
+
+    // INFO: embed the output norm and token_embed in the model
+
+    model->output_norm = output_norm;
+    model->token_embedding = token_embedding;
+
+    // Now we want to start mapping the remaining tensors and layers.
+    // We will likely iterate over the tensor infos starting from index 2,
+    // and map each tensor to the appropriate field in each layer struct.
+    // This involves parsing tensor names and shapes to identify which tensor
+    // corresponds to which layer and component (e.g., attention q, k, v, ffn,
+    // norms).
+
+    for(int i = 2; i < model->header.tensor_count; i++) {
+        uint64_t offset = infos[i].offset;
+        struct Tensor tensor = {.data = (const uint8_t *)model->mmap_base +
+                                        tensor_data_start + offset,
+                                .ndim = infos[i].ndim,
+                                .type = infos[i].type};
+        memcpy(tensor.shape, infos[i].shape, sizeof(infos[i].shape));
+    }
+
     return true;
 }
 
