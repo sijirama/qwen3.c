@@ -11,6 +11,14 @@ struct Tensor {
     int type;
 };
 
+struct GGUFTensorInfo {
+    char *name;
+    uint32_t ndim;
+    uint64_t shape[4];
+    uint32_t type;
+    uint64_t offset;
+};
+
 struct GGUFHeader {
     char magic[4];
     uint32_t version;
@@ -347,6 +355,72 @@ bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header,
     return true;
 }
 
+static bool read_gguf_tensor_info(FILE *file, struct GGUFTensorInfo *info) {
+    memset(info, 0, sizeof(*info));
+
+    if(!gguf_read_string(file, &info->name))
+        return false;
+
+    if(!gguf_read_u32(file, &info->ndim))
+        goto fail;
+
+    if(info->ndim == 0 || info->ndim > 4)
+        goto fail;
+
+    for(uint32_t i = 0; i < info->ndim; i++) {
+        if(!gguf_read_u64(file, &info->shape[i]))
+            goto fail;
+
+        if(info->shape[i] == 0)
+            goto fail;
+    }
+
+    if(!gguf_read_u32(file, &info->type))
+        goto fail;
+
+    if(!gguf_read_u64(file, &info->offset))
+        goto fail;
+
+    return true;
+
+fail:
+    free(info->name);
+    info->name = NULL;
+    return false;
+}
+
+bool read_gguf_tensor_infos(FILE *file, const struct GGUFHeader *header,
+                            struct GGUFTensorInfo **out_infos) {
+
+    if(!file || !header || !out_infos)
+        return false;
+
+    *out_infos = NULL;
+
+    if(header->tensor_count == 0 ||
+       header->tensor_count > SIZE_MAX / sizeof(struct GGUFTensorInfo))
+        return false;
+
+    struct GGUFTensorInfo *infos =
+        calloc((size_t)header->tensor_count, sizeof(struct GGUFTensorInfo));
+
+    if(!infos)
+        return false;
+
+    for(uint64_t i = 0; i < header->tensor_count; i++) {
+        if(!read_gguf_tensor_info(file, &infos[i])) {
+            for(uint64_t j = 0; j < i; j++)
+                free(infos[j].name);
+
+            free(infos);
+            return false;
+        }
+    }
+
+    *out_infos = infos;
+    return true;
+}
+
 int main(int argc, char **argv) {
 
     if(argc < 2) {
@@ -386,6 +460,24 @@ int main(int argc, char **argv) {
     printf("Head dimension: %u\n", config.head_dim);
     printf("Context length: %u\n", config.context_length);
 
+    struct GGUFTensorInfo *infos = NULL;
+
+    if(!read_gguf_tensor_infos(file, &header, &infos)) {
+        fprintf(stderr, "Failed to parse tensor descriptors\n");
+        fclose(file);
+        return 1;
+    }
+
+    for(uint64_t i = 0; i < header.tensor_count; i++) {
+        printf("%s | ndim=%u | type=%u | offset=%llu\n", infos[i].name,
+               infos[i].ndim, infos[i].type,
+               (unsigned long long)infos[i].offset);
+    }
+
+    for(uint64_t i = 0; i < header.tensor_count; i++)
+        free(infos[i].name);
+
+    free(infos);
     fclose(file);
     return 0;
 }
