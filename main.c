@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -271,8 +272,7 @@ bool read_gguf_header(FILE *model, struct GGUFHeader *header) {
         return false;
     }
 
-    _Static_assert(sizeof(struct GGUFHeader) == 24,
-                   "Unexpected GGUFHeader layout");
+    _Static_assert(sizeof(struct GGUFHeader) == 24, "Unexpected GGUFHeader layout");
 
     if(fseek(model, 0, SEEK_SET) != 0) {
         return false;
@@ -351,9 +351,8 @@ bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header,
     }
 
     // Minimal sanity checks.
-    if(config->num_layers == 0 || config->hidden_size == 0 ||
-       config->num_heads == 0 || config->num_kv_heads == 0 ||
-       config->num_heads % config->num_kv_heads != 0) {
+    if(config->num_layers == 0 || config->hidden_size == 0 || config->num_heads == 0 ||
+       config->num_kv_heads == 0 || config->num_heads % config->num_kv_heads != 0) {
         return false;
     }
 
@@ -465,10 +464,7 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
     model->mmap_base = base;
     model->mmap_size = file_size;
 
-    // INFO: start mapping tensors;
-
-    uint64_t temp = 0;
-    uint64_t tensor_idx = 0;
+    // start mapping tensors;
 
     // INFO: output_norm.weight is the first tensor in the tensor info array
     struct Tensor output_norm = {.ndim = infos[0].ndim,
@@ -481,8 +477,7 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
     struct Tensor token_embedding = {.ndim = infos[1].ndim,
                                      .type = infos[1].type,
                                      .data = (const uint8_t *)model->mmap_base +
-                                             tensor_data_start +
-                                             infos[1].offset};
+                                             tensor_data_start + infos[1].offset};
     memcpy(token_embedding.shape, infos[1].shape, sizeof(infos[1].shape));
 
     // INFO: embed the output norm and token_embed in the model
@@ -490,23 +485,73 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
     model->output_norm = output_norm;
     model->token_embedding = token_embedding;
 
-    // Now we want to start mapping the remaining tensors and layers.
-    // We will likely iterate over the tensor infos starting from index 2,
-    // and map each tensor to the appropriate field in each layer struct.
-    // This involves parsing tensor names and shapes to identify which tensor
-    // corresponds to which layer and component (e.g., attention q, k, v, ffn,
-    // norms).
+    // now we want to start mapping the remaining tensors and layers
+    // we will iterate over the tensor infos starting from index 2
+    // parse tensor names to find layer index and component
+    // assign tensors to the correct layer fields
 
-    for(int i = 2; i < model->header.tensor_count; i++) {
+    // allocate layers array
+    model->layers = calloc(model->config.num_layers, sizeof(struct Qwen3Layer));
+    if(!model->layers) {
+        fclose(file);
+        return false;
+    }
+
+    for(uint64_t i = 2; i < model->header.tensor_count; i++) {
+        char *name = infos[i].name;
         uint64_t offset = infos[i].offset;
+
         struct Tensor tensor = {.data = (const uint8_t *)model->mmap_base +
                                         tensor_data_start + offset,
                                 .ndim = infos[i].ndim,
                                 .type = infos[i].type};
+
         memcpy(tensor.shape, infos[i].shape, sizeof(infos[i].shape));
+
+        // simple parsing: find layer index from name
+        int layer_idx = -1;
+        if(sscanf(name, "transformer.layers.%d.", &layer_idx) != 1) {
+            // not a layer tensor, skip
+            continue;
+        }
+
+        if(layer_idx < 0 || (uint32_t)layer_idx >= model->config.num_layers) {
+            // invalid layer index, skip
+            continue;
+        }
+
+        struct Qwen3Layer *layer = &model->layers[layer_idx];
+
+        // map tensor to layer field based on suffix
+        if(strstr(name, "attention.wq.weight")) {
+            layer->attn_q = tensor;
+        } else if(strstr(name, "attention.wk.weight")) {
+            layer->attn_k = tensor;
+        } else if(strstr(name, "attention.wv.weight")) {
+            layer->attn_v = tensor;
+        } else if(strstr(name, "attention.wo.weight")) {
+            layer->attn_output = tensor;
+        } else if(strstr(name, "attention_norm.weight")) {
+            layer->attn_norm = tensor;
+        } else if(strstr(name, "ffn_norm.weight")) {
+            layer->ffn_norm = tensor;
+        } else if(strstr(name, "ffn.up_proj.weight")) {
+            layer->ffn_up = tensor;
+        } else if(strstr(name, "ffn.gate_proj.weight")) {
+            layer->ffn_gate = tensor;
+        } else if(strstr(name, "ffn.down_proj.weight")) {
+            layer->ffn_down = tensor;
+        } else if(strstr(name, "attention.wq_norm.weight")) {
+            layer->attn_q_norm = tensor;
+        } else if(strstr(name, "attention.wk_norm.weight")) {
+            layer->attn_k_norm = tensor;
+        }
     }
 
     return true;
+
+    // this honestly should do the work, pretty short and cool, obv better ways
+    // to optimize this but i'm a strict deadline for this engine
 }
 
 int main(int argc, char **argv) {
@@ -564,8 +609,7 @@ int main(int argc, char **argv) {
     uint64_t alignment = 32; // GGUF default
     uint64_t offset = (uint64_t)position;
 
-    uint64_t tensor_data_start =
-        offset + (alignment - (offset % alignment)) % alignment;
+    uint64_t tensor_data_start = offset + (alignment - (offset % alignment)) % alignment;
 
     struct Qwen3Model *model = malloc(sizeof(struct Qwen3Model));
 
@@ -585,6 +629,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // we could theoretically free the info here, the main problem is that i
+    // print everything out right after
+    // maybe i should print out the actual layers and their tensors instead ?
+    // idk i'm lazy asfuck rn
+
     // NOTE: print model data basically
 
     printf("GGUF version: %u\n", header.version);
@@ -597,9 +646,32 @@ int main(int argc, char **argv) {
     printf("Context length: %u\n", config.context_length);
 
     for(uint64_t i = 0; i < header.tensor_count; i++) {
-        printf("%s | ndim=%u | type=%u | offset=%llu\n", infos[i].name,
-               infos[i].ndim, infos[i].type,
-               (unsigned long long)infos[i].offset);
+        printf("%s | ndim=%u | type=%u | offset=%llu\n", infos[i].name, infos[i].ndim,
+               infos[i].type, (unsigned long long)infos[i].offset);
+    }
+
+    // print some model layer and tensor stuff to verify it worked
+    for(uint32_t i = 0; i < config.num_layers; i++) {
+        struct Qwen3Layer *layer = &model->layers[i];
+        printf("layer %u:\n", i);
+        printf("  attn_q shape: %ld %ld\n", layer->attn_q.shape[0],
+               layer->attn_q.shape[1]);
+        printf("  attn_k shape: %ld %ld\n", layer->attn_k.shape[0],
+               layer->attn_k.shape[1]);
+        printf("  attn_v shape: %ld %ld\n", layer->attn_v.shape[0],
+               layer->attn_v.shape[1]);
+        printf("  attn_output shape: %ld %ld\n", layer->attn_output.shape[0],
+               layer->attn_output.shape[1]);
+        printf("  attn_norm shape: %ld\n", layer->attn_norm.shape[0]);
+        printf("  ffn_norm shape: %ld\n", layer->ffn_norm.shape[0]);
+        printf("  ffn_up shape: %ld %ld\n", layer->ffn_up.shape[0],
+               layer->ffn_up.shape[1]);
+        printf("  ffn_gate shape: %ld %ld\n", layer->ffn_gate.shape[0],
+               layer->ffn_gate.shape[1]);
+        printf("  ffn_down shape: %ld %ld\n", layer->ffn_down.shape[0],
+               layer->ffn_down.shape[1]);
+        printf("  attn_q_norm shape: %ld\n", layer->attn_q_norm.shape[0]);
+        printf("  attn_k_norm shape: %ld\n", layer->attn_k_norm.shape[0]);
     }
 
     // NOTE: free pointers
