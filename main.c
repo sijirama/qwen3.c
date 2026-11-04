@@ -445,7 +445,7 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
     }
 
     long file_size = ftell(file);
-    if(file_size == -1) {
+    if(file_size <= 0) {
         fclose(file);
         return false;
     }
@@ -464,42 +464,38 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
     model->mmap_base = base;
     model->mmap_size = file_size;
 
-    // start mapping tensors;
-
-    // INFO: output_norm.weight is the first tensor in the tensor info array
-    struct Tensor output_norm = {.ndim = infos[0].ndim,
-                                 .type = infos[0].type,
-                                 .data = (const uint8_t *)model->mmap_base +
-                                         tensor_data_start + infos[0].offset};
-    memcpy(output_norm.shape, infos[0].shape, sizeof(infos[0].shape));
-
-    // INFO: token_embed.weight is the second tensor in the tensor info array
-    struct Tensor token_embedding = {.ndim = infos[1].ndim,
-                                     .type = infos[1].type,
-                                     .data = (const uint8_t *)model->mmap_base +
-                                             tensor_data_start + infos[1].offset};
-    memcpy(token_embedding.shape, infos[1].shape, sizeof(infos[1].shape));
-
-    // INFO: embed the output norm and token_embed in the model
-
-    model->output_norm = output_norm;
-    model->token_embedding = token_embedding;
-
-    // now we want to start mapping the remaining tensors and layers
-    // we will iterate over the tensor infos starting from index 2
-    // parse tensor names to find layer index and component
-    // assign tensors to the correct layer fields
+    // Once mmap succeeds, the mapping remains valid after closing the file.
+    // The mapping owns the model data from this point onward.
+    fclose(file);
+    file = NULL;
 
     // allocate layers array
     model->layers = calloc(model->config.num_layers, sizeof(struct Qwen3Layer));
     if(!model->layers) {
-        fclose(file);
-        return false;
+        goto fail_mapped;
     }
 
-    for(uint64_t i = 2; i < model->header.tensor_count; i++) {
+    bool found_output_norm = false;
+    bool found_token_embedding = false;
+
+    // The first version of the loader assumed output_norm.weight and
+    // token_embd.weight were tensor descriptors 0 and 1. That was true in
+    // our test GGUF, but descriptor ordering is not guaranteed by the format,
+    // so we now find both tensors by name in the same loop as the layer data.
+
+    for(uint64_t i = 0; i < model->header.tensor_count; i++) {
         char *name = infos[i].name;
         uint64_t offset = infos[i].offset;
+
+        // Validate the tensor start before doing pointer arithmetic. This
+        // prevents a malformed GGUF offset from producing a pointer outside
+        // the memory-mapped file. Full tensor-size validation comes later.
+
+        if(tensor_data_start > model->mmap_size ||
+           offset > model->mmap_size - tensor_data_start) {
+            fprintf(stderr, "Tensor '%s' starts outside the mapped file\n", name);
+            goto fail_mapped;
+        }
 
         struct Tensor tensor = {.data = (const uint8_t *)model->mmap_base +
                                         tensor_data_start + offset,
@@ -507,6 +503,18 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
                                 .type = infos[i].type};
 
         memcpy(tensor.shape, infos[i].shape, sizeof(infos[i].shape));
+
+        if(strcmp(name, "output_norm.weight") == 0) {
+            model->output_norm = tensor;
+            found_output_norm = true;
+            continue;
+        }
+
+        if(strcmp(name, "token_embd.weight") == 0) {
+            model->token_embedding = tensor;
+            found_token_embedding = true;
+            continue;
+        }
 
         // simple parsing: find layer index from name
         int layer_idx = -1;
@@ -548,12 +556,51 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
         }
     }
 
+    if(!found_output_norm || !found_token_embedding) {
+        fprintf(stderr, "Missing output norm or token embedding tensor\n");
+        goto fail_mapped;
+    }
+
+    for(uint32_t i = 0; i < model->config.num_layers; i++) {
+        struct Qwen3Layer *layer = &model->layers[i];
+
+        if(!layer->attn_q.data || !layer->attn_k.data || !layer->attn_v.data ||
+           !layer->attn_output.data || !layer->attn_norm.data || !layer->ffn_norm.data ||
+           !layer->ffn_up.data || !layer->ffn_gate.data || !layer->ffn_down.data ||
+           !layer->attn_q_norm.data || !layer->attn_k_norm.data) {
+            fprintf(stderr, "Missing tensor in layer %u\n", i);
+            goto fail_mapped;
+        }
+    }
+
     return true;
 
-    // this honestly should do the work, pretty short and cool, obv better ways
-    // to optimize this but i'm a strict deadline for this engine
+fail_mapped:
+    free(model->layers);
+    model->layers = NULL;
+    munmap(model->mmap_base, model->mmap_size);
+    model->mmap_base = NULL;
+    model->mmap_size = 0;
+    if(file)
+        fclose(file);
+    return false;
 }
 
+void destroy_model(struct Qwen3Model *model) {
+    if(!model)
+        return;
+
+    free(model->layers);
+    model->layers = NULL;
+
+    if(model->mmap_base) {
+        munmap(model->mmap_base, model->mmap_size);
+        model->mmap_base = NULL;
+        model->mmap_size = 0;
+    }
+}
+
+#ifndef QWEN3_TEST
 int main(int argc, char **argv) {
 
     if(argc < 2) {
@@ -629,50 +676,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // we could theoretically free the info here, the main problem is that i
-    // print everything out right after
-    // maybe i should print out the actual layers and their tensors instead ?
-    // idk i'm lazy asfuck rn
-
-    // NOTE: print model data basically
-
-    printf("GGUF version: %u\n", header.version);
-    printf("Tensor count: %llu\n", (unsigned long long)header.tensor_count);
-    printf("Layers: %u\n", config.num_layers);
-    printf("Hidden size: %u\n", config.hidden_size);
-    printf("Attention heads: %u\n", config.num_heads);
-    printf("KV heads: %u\n", config.num_kv_heads);
-    printf("Head dimension: %u\n", config.head_dim);
-    printf("Context length: %u\n", config.context_length);
-
-    for(uint64_t i = 0; i < header.tensor_count; i++) {
-        printf("%s | ndim=%u | type=%u | offset=%llu\n", infos[i].name, infos[i].ndim,
-               infos[i].type, (unsigned long long)infos[i].offset);
-    }
-
-    // print some model layer and tensor stuff to verify it worked
-    for(uint32_t i = 0; i < config.num_layers; i++) {
-        struct Qwen3Layer *layer = &model->layers[i];
-        printf("layer %u:\n", i);
-        printf("  attn_q shape: %ld %ld\n", layer->attn_q.shape[0],
-               layer->attn_q.shape[1]);
-        printf("  attn_k shape: %ld %ld\n", layer->attn_k.shape[0],
-               layer->attn_k.shape[1]);
-        printf("  attn_v shape: %ld %ld\n", layer->attn_v.shape[0],
-               layer->attn_v.shape[1]);
-        printf("  attn_output shape: %ld %ld\n", layer->attn_output.shape[0],
-               layer->attn_output.shape[1]);
-        printf("  attn_norm shape: %ld\n", layer->attn_norm.shape[0]);
-        printf("  ffn_norm shape: %ld\n", layer->ffn_norm.shape[0]);
-        printf("  ffn_up shape: %ld %ld\n", layer->ffn_up.shape[0],
-               layer->ffn_up.shape[1]);
-        printf("  ffn_gate shape: %ld %ld\n", layer->ffn_gate.shape[0],
-               layer->ffn_gate.shape[1]);
-        printf("  ffn_down shape: %ld %ld\n", layer->ffn_down.shape[0],
-               layer->ffn_down.shape[1]);
-        printf("  attn_q_norm shape: %ld\n", layer->attn_q_norm.shape[0]);
-        printf("  attn_k_norm shape: %ld\n", layer->attn_k_norm.shape[0]);
-    }
+    printf("Loaded Qwen3 GGUF successfully: %u layers, %llu tensors, %u hidden size\n",
+           config.num_layers, (unsigned long long)header.tensor_count,
+           config.hidden_size);
 
     // NOTE: free pointers
 
@@ -681,5 +687,8 @@ int main(int argc, char **argv) {
 
     free(infos);
     fclose(file);
+    destroy_model(model);
+    free(model);
     return 0;
 }
+#endif
