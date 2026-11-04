@@ -510,7 +510,7 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
 
         // simple parsing: find layer index from name
         int layer_idx = -1;
-        if(sscanf(name, "transformer.layers.%d.", &layer_idx) != 1) {
+        if(sscanf(name, "blk.%d.", &layer_idx) != 1) {
             // not a layer tensor, skip
             continue;
         }
@@ -523,27 +523,27 @@ bool qwen3_map_file(const char *path, struct GGUFTensorInfo *infos,
         struct Qwen3Layer *layer = &model->layers[layer_idx];
 
         // map tensor to layer field based on suffix
-        if(strstr(name, "attention.wq.weight")) {
+        if(strstr(name, "attn_q.weight")) {
             layer->attn_q = tensor;
-        } else if(strstr(name, "attention.wk.weight")) {
+        } else if(strstr(name, "attn_k.weight")) {
             layer->attn_k = tensor;
-        } else if(strstr(name, "attention.wv.weight")) {
+        } else if(strstr(name, "attn_v.weight")) {
             layer->attn_v = tensor;
-        } else if(strstr(name, "attention.wo.weight")) {
+        } else if(strstr(name, "attn_output.weight")) {
             layer->attn_output = tensor;
-        } else if(strstr(name, "attention_norm.weight")) {
+        } else if(strstr(name, "attn_norm.weight")) {
             layer->attn_norm = tensor;
         } else if(strstr(name, "ffn_norm.weight")) {
             layer->ffn_norm = tensor;
-        } else if(strstr(name, "ffn.up_proj.weight")) {
+        } else if(strstr(name, "ffn_up.weight")) {
             layer->ffn_up = tensor;
-        } else if(strstr(name, "ffn.gate_proj.weight")) {
+        } else if(strstr(name, "ffn_gate.weight")) {
             layer->ffn_gate = tensor;
-        } else if(strstr(name, "ffn.down_proj.weight")) {
+        } else if(strstr(name, "ffn_down.weight")) {
             layer->ffn_down = tensor;
-        } else if(strstr(name, "attention.wq_norm.weight")) {
+        } else if(strstr(name, "attn_q_norm.weight")) {
             layer->attn_q_norm = tensor;
-        } else if(strstr(name, "attention.wk_norm.weight")) {
+        } else if(strstr(name, "attn_k_norm.weight")) {
             layer->attn_k_norm = tensor;
         }
     }
