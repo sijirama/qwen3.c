@@ -79,7 +79,7 @@ enum {
     GGUF_TYPE_FLOAT64 = 12
 };
 
-// Read exactly n bytes from the file.
+// read exactly n bytes from the file into dst.
 static bool gguf_read(FILE *file, void *dst, size_t n) {
     return fread(dst, 1, n, file) == n;
 }
@@ -90,7 +90,8 @@ static bool gguf_read_u32(FILE *file, uint32_t *value) {
     if(!gguf_read(file, b, sizeof(b)))
         return false;
 
-    *value = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    *value = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
+             ((uint32_t)b[3] << 24);
 
     return true;
 }
@@ -257,7 +258,8 @@ bool read_gguf_header(FILE *model, struct GGUFHeader *header) {
         return false;
     }
 
-    _Static_assert(sizeof(struct GGUFHeader) == 24, "Unexpected GGUFHeader layout");
+    _Static_assert(sizeof(struct GGUFHeader) == 24,
+                   "Unexpected GGUFHeader layout");
 
     if(fseek(model, 0, SEEK_SET) != 0) {
         return false;
@@ -281,7 +283,10 @@ bool read_gguf_header(FILE *model, struct GGUFHeader *header) {
 }
 
 // parse metadata and populate the Qwen3 configuration.
-bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header, struct Qwen3Config *config) {
+// important reading:
+// https://github.com/ggml-org/ggml/blob/master/docs/gguf.md?utm_source=chatgpt.com#file-structure
+bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header,
+                        struct Qwen3Config *config) {
     if(!file || !header || !config)
         return false;
 
@@ -333,7 +338,8 @@ bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header, struct Qwen
     }
 
     // Minimal sanity checks.
-    if(config->num_layers == 0 || config->hidden_size == 0 || config->num_heads == 0 || config->num_kv_heads == 0 ||
+    if(config->num_layers == 0 || config->hidden_size == 0 ||
+       config->num_heads == 0 || config->num_kv_heads == 0 ||
        config->num_heads % config->num_kv_heads != 0) {
         return false;
     }
