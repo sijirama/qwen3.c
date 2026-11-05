@@ -77,7 +77,7 @@ struct Qwen3Model {
 // GGUF MODEL FILE PARSER
 // ============================================================
 
-enum {
+enum GGUF_TYPE {
     GGUF_TYPE_UINT8 = 0,
     GGUF_TYPE_INT8 = 1,
     GGUF_TYPE_UINT16 = 2,
@@ -589,6 +589,8 @@ fail_mapped:
 // ============================================================
 // TOKENIZER
 // ============================================================
+
+struct Qwen3Tokenizer {};
 
 // ============================================================
 // PROGRAM CONTROLS
