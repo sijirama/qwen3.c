@@ -6,6 +6,14 @@
 #include <string.h>
 #include <sys/mman.h>
 
+struct Qwen3Tokenizer {
+    char **vocab; // array of strings
+    uint64_t vocab_size;
+
+    char **merges; // array of strings
+    uint64_t merge_count;
+};
+
 struct GGUFTensorInfo {
     char *name;
     uint32_t ndim;
@@ -267,6 +275,44 @@ static bool gguf_config_f32(FILE *file, uint32_t type, float *out) {
     return gguf_read_f32(file, out);
 }
 
+static bool gguf_read_string_array(FILE *file, uint32_t type, char ***out_strings,
+                                   uint64_t *out_count) {
+    if(type != GGUF_TYPE_ARRAY)
+        return false;
+
+    uint32_t element_type;
+    uint64_t count;
+
+    if(!gguf_read_u32(file, &element_type) || !gguf_read_u64(file, &count))
+        return false;
+
+    if(element_type != GGUF_TYPE_STRING)
+        return false;
+
+    if(count > SIZE_MAX / sizeof(char *))
+        return false;
+
+    char **strings = calloc((size_t)count, sizeof(*strings));
+
+    if(!strings && count != 0)
+        return false;
+
+    for(uint64_t i = 0; i < count; i++) {
+        if(!gguf_read_string(file, &strings[i])) {
+            for(uint64_t j = 0; j < i; j++)
+                free(strings[j]);
+
+            free(strings);
+            return false;
+        }
+    }
+
+    *out_strings = strings;
+    *out_count = count;
+
+    return true;
+}
+
 bool read_gguf_header(FILE *model, struct GGUFHeader *header) {
     if(model == NULL || header == NULL) {
         return false;
@@ -299,11 +345,12 @@ bool read_gguf_header(FILE *model, struct GGUFHeader *header) {
 // important reading:
 // https://github.com/ggml-org/ggml/blob/master/docs/gguf.md?utm_source=chatgpt.com#file-structure
 bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header,
-                        struct Qwen3Config *config) {
+                        struct Qwen3Config *config, struct Qwen3Tokenizer *tokenizer) {
     if(!file || !header || !config)
         return false;
 
     memset(config, 0, sizeof(*config));
+    memset(tokenizer, 0, sizeof(*tokenizer));
 
     for(uint64_t i = 0; i < header->metadata_kv_count; i++) {
         char *key = NULL;
@@ -337,8 +384,11 @@ bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header,
         } else if(strcmp(key, "qwen3.attention.layer_norm_rms_epsilon") == 0) {
             ok = gguf_config_f32(file, type, &config->rms_norm_eps);
         } else if(strcmp(key, "tokenizer.ggml.tokens") == 0) {
-            // We'll parse tokenizer vocabulary later.
-            ok = gguf_skip_value(file, type);
+            ok = gguf_read_string_array(file, type, &tokenizer->vocab,
+                                        &tokenizer->vocab_size);
+        } else if(strcmp(key, "tokenizer.ggml.merges") == 0) {
+            ok = gguf_read_string_array(file, type, &tokenizer->merges,
+                                        &tokenizer->merge_count);
         } else {
             // Unknown or currently unused metadata.
             ok = gguf_skip_value(file, type);
@@ -590,8 +640,6 @@ fail_mapped:
 // TOKENIZER
 // ============================================================
 
-struct Qwen3Tokenizer {};
-
 // ============================================================
 // PROGRAM CONTROLS
 // ============================================================
@@ -633,8 +681,9 @@ int main(int argc, char **argv) {
     }
 
     struct Qwen3Config config;
+    struct Qwen3Tokenizer tokenizer;
 
-    if(!read_gguf_metadata(file, &header, &config)) {
+    if(!read_gguf_metadata(file, &header, &config, &tokenizer)) {
         fprintf(stderr, "Failed to parse GGUF metadata\n");
         fclose(file);
         return 1;
@@ -688,6 +737,8 @@ int main(int argc, char **argv) {
     printf("Loaded Qwen3 GGUF successfully: %u layers, %llu tensors, %u hidden size\n",
            config.num_layers, (unsigned long long)header.tensor_count,
            config.hidden_size);
+    printf(" Tokenizer vocab size: %llu\n", (unsigned long long)tokenizer.vocab_size);
+    printf(" Tokenizer merge count: %llu\n", (unsigned long long)tokenizer.merge_count);
 
     // NOTE: free pointers
 
