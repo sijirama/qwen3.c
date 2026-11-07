@@ -1,10 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <locale.h>
+#include <pcre2.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <wchar.h>
 
 struct Qwen3Tokenizer {
     char **vocab; // array of strings
@@ -389,6 +393,15 @@ bool read_gguf_metadata(FILE *file, const struct GGUFHeader *header,
         } else if(strcmp(key, "tokenizer.ggml.merges") == 0) {
             ok = gguf_read_string_array(file, type, &tokenizer->merges,
                                         &tokenizer->merge_count);
+        } else if(strcmp(key, "tokenizer.ggml.pre") == 0) {
+            char *pre_str = NULL;
+            if(!gguf_read_string(file, &pre_str)) {
+                free(key);
+                return false;
+            }
+            printf("tokenizer.ggml.pre: %s\n", pre_str);
+            free(pre_str);
+            ok = true;
         } else {
             // Unknown or currently unused metadata.
             ok = gguf_skip_value(file, type);
@@ -640,6 +653,221 @@ fail_mapped:
 // TOKENIZER
 // ============================================================
 
+// In C, char occupies exactly one byte. But one byte is not necessarily one complete
+// Unicode character.
+
+// our vocabulary contains the tokenizer's serialized token representations, not
+// necessarily the original raw text bytes.
+
+struct Chunk {
+    size_t start;
+    size_t len;
+};
+
+struct ChunkList {
+    struct Chunk *items;
+    size_t count;
+};
+
+// splits text using Qwen2 pre-tokenization rules.
+// start and len are UTF-8 byte offsets.
+// we use qwen2 pretokenization scheme because that's what qwen3 uses (verified from the
+// fileformat)
+// used PCRE2, a C-compatible regex engine that supports Unicode properties
+
+static const char *QWEN2_PATTERN = "(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+                                   "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"
+                                   "|\\p{N}"
+                                   "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*"
+                                   "|\\s*[\\r\\n]+"
+                                   "|\\s+(?!\\S)"
+                                   "|\\s+";
+
+/*
+ * Splits UTF-8 text into chunks using Qwen2 pre-tokenization rules.
+ *
+ * The function does not allocate separate strings for each chunk.
+ * Instead, it returns byte offsets and lengths into the original text.
+ *
+ * Example:
+ *
+ *   Input:
+ *       "Hello world! I'm learning C in 2026."
+ *
+ *   Output chunks:
+ *       ["Hello", " world", "!", " I", "'m",
+ *        " learning", " C", " in", " ", "2", "0", "2", "6", "."]
+ *
+ *   Each chunk is represented by:
+ *
+ *       struct Chunk {
+ *           size_t start; // byte offset into original text
+ *           size_t len;   // number of bytes in chunk
+ *       };
+ *
+ *   Example:
+ *       "Hello"  -> { start: 0,  len: 5 }
+ *       " world" -> { start: 5,  len: 6 }
+ *       "!"      -> { start: 11, len: 1 }
+ *
+ *   Usage:
+ *       struct ChunkList chunks =
+ *           qwen2_pre_tokenize(text, strlen(text));
+ *
+ *       for (size_t i = 0; i < chunks.count; i++) {
+ *           struct Chunk c = chunks.items[i];
+ *           printf("%.*s\n", (int)c.len, text + c.start);
+ *       }
+ *
+ *       free(chunks.items);
+ *
+ *   The returned chunks are processed independently by byte-level BPE.
+ */
+
+struct ChunkList qwen2_pre_tokenize(const char *text, size_t text_len) {
+    struct ChunkList result = {0};
+
+    if(!text || text_len == 0)
+        return result;
+
+    int error;
+    PCRE2_SIZE error_offset;
+
+    pcre2_code *regex = pcre2_compile((PCRE2_SPTR)QWEN2_PATTERN, PCRE2_ZERO_TERMINATED,
+                                      PCRE2_UTF | PCRE2_UCP, &error, &error_offset, NULL);
+
+    if(!regex)
+        return result;
+
+    pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(regex, NULL);
+
+    if(!match_data) {
+        pcre2_code_free(regex);
+        return result;
+    }
+
+    size_t capacity = 16;
+    result.items = malloc(capacity * sizeof(struct Chunk));
+
+    if(!result.items)
+        goto cleanup;
+
+    PCRE2_SIZE offset = 0;
+
+    while(offset < text_len) {
+        int rc =
+            pcre2_match(regex, (PCRE2_SPTR)text, text_len, offset, 0, match_data, NULL);
+
+        if(rc < 0)
+            goto fail;
+
+        PCRE2_SIZE *ovector = pcre2_get_ovector_pointer(match_data);
+
+        size_t start = ovector[0];
+        size_t end = ovector[1];
+
+        // The pattern must consume input continuously.
+        if(start != offset || end <= start)
+            goto fail;
+
+        if(result.count == capacity) {
+            if(capacity > SIZE_MAX / (2 * sizeof(struct Chunk)))
+                goto fail;
+
+            capacity *= 2;
+
+            struct Chunk *items = realloc(result.items, capacity * sizeof(struct Chunk));
+
+            if(!items)
+                goto fail;
+
+            result.items = items;
+        }
+
+        result.items[result.count++] = (struct Chunk){.start = start, .len = end - start};
+
+        offset = end;
+    }
+
+    goto cleanup;
+
+fail:
+    free(result.items);
+    result = (struct ChunkList){0};
+
+cleanup:
+    pcre2_match_data_free(match_data);
+    pcre2_code_free(regex);
+
+    return result;
+}
+
+struct BPESymbol {
+    size_t start;
+    size_t len;
+};
+
+struct TokenIDs {
+    uint32_t *items;
+    size_t count;
+};
+
+bool qwen3_tokenize(struct ChunkList *chunks, struct TokenIDs *tokenIds,
+                    const char *text) {
+
+    if(!chunks || !tokenIds || !text)
+        return false;
+
+    if(chunks->count == 0 || tokenIds->count == 0)
+        return false;
+
+    if(chunks->count != tokenIds->count)
+        return false;
+
+    // 1. Enable the system's default locale (required for proper UTF-8 interpretation)
+    setlocale(LC_ALL, "");
+    struct Chunk c;
+
+    for(size_t i = 0; i < chunks->count; i++) {
+
+        c = chunks->items[i];
+        const char *utf8_bytes = text + c.start;
+
+        // Create a byte array for the chunk from the text input
+        char *chunk_bytes = malloc(c.len + 1);
+        if(!chunk_bytes) {
+            return false;
+        }
+
+        memcpy(chunk_bytes, utf8_bytes, c.len);
+        chunk_bytes[c.len] = '\0'; // Manually null terminate the narrow string chunk
+
+        // Determine the size needed for the wide-character buffer
+        size_t num_chars = mbstowcs(NULL, chunk_bytes, 0);
+        if(num_chars == (size_t)-1) {
+            perror("Invalid multibyte sequence encountered");
+            return false;
+        }
+
+        // Allocate memory for the Unicode string (no null termination)
+        wchar_t *unicode_string = malloc((num_chars + 1) * sizeof(wchar_t));
+        if(!unicode_string)
+            return false;
+
+        // perform the actual conversion
+        mbstowcs(unicode_string, chunk_bytes, num_chars + 1);
+
+        printf("%d\n", (int)num_chars);
+        printf("Converted string: %ls\n", unicode_string);
+        printf("Number of Unicode characters: %zu\n", num_chars);
+
+        free(unicode_string);
+        free(chunk_bytes);
+    }
+
+    return true;
+}
+
 // ============================================================
 // PROGRAM CONTROLS
 // ============================================================
@@ -739,6 +967,34 @@ int main(int argc, char **argv) {
            config.hidden_size);
     printf(" Tokenizer vocab size: %llu\n", (unsigned long long)tokenizer.vocab_size);
     printf(" Tokenizer merge count: %llu\n", (unsigned long long)tokenizer.merge_count);
+
+    // make use of qwen3_tokenize here for an example string
+    const char *example_text = "Hello world! I'm learning C in 2026.";
+    struct ChunkList chunks = qwen2_pre_tokenize(example_text, strlen(example_text));
+
+    if(chunks.count == 0) {
+        fprintf(stderr, "Failed to pre-tokenize example text\n");
+    } else {
+        struct TokenIDs token_ids;
+        token_ids.count = chunks.count;
+        token_ids.items = malloc(token_ids.count * sizeof(uint32_t));
+        if(!token_ids.items) {
+            fprintf(stderr, "Failed to allocate token IDs\n");
+        } else {
+            // for demonstration, assign dummy token IDs (e.g., index values)
+            for(size_t i = 0; i < token_ids.count; i++) {
+                token_ids.items[i] = (uint32_t)i;
+            }
+
+            if(!qwen3_tokenize(&chunks, &token_ids, example_text)) {
+                fprintf(stderr, "Tokenization failed\n");
+            }
+
+            free(token_ids.items);
+        }
+    }
+
+    free(chunks.items);
 
     // NOTE: free pointers
 
