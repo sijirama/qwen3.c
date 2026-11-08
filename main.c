@@ -85,6 +85,44 @@ struct Qwen3Model {
     struct Tensor output;
 };
 
+/*
+Modern C Standard (_Float16)
+
+Introduced formally in the ISO/IEC TS 18661-3 extension and incorporated into the standard
+library, you can use the _Float16 type. • Compiler Support: Supported by GCC and Clang on
+architectures that natively support it or can emulate it (such as AArch64/ARM64 and x86
+with SSE2 enabled).
+
+https://gcc.gnu.org/onlinedocs/gcc/Half-Precision.html
+
+example:
+       _Float16 half_float = 12.34f16; // 'f16' literal suffix
+
+Now suppose you want:
+    weight[0][0];
+    weight[0][1];
+    weight[0][35];
+
+You can still retrieve those logical weights, but you must calculate which physical block
+contains them.
+
+For a weight at logical position [row, col]:
+    size_t block_index = col / 32;
+    size_t within_block = col % 32;
+
+Then:
+    block_q8_0 *block = &blocks[row * 32 + block_index];
+
+    float value = fp16_to_fp32(block->scale) *
+                  block->qs[within_block];
+
+*/
+
+typedef struct {
+    _Float16 scale; // FP16 scale: 2 bytes
+    int8_t qs[32];  // 32 quantized weights
+} block_q8_0;
+
 // ============================================================
 // GGUF MODEL FILE PARSER
 // ============================================================
