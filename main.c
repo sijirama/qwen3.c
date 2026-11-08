@@ -807,22 +807,218 @@ struct BPESymbol {
     size_t len;
 };
 
+struct BPESymbolList {
+    struct BPESymbol *items;
+    size_t count;
+};
+
 struct TokenIDs {
     uint32_t *items;
     size_t count;
 };
 
-bool qwen3_tokenize(struct ChunkList *chunks, struct TokenIDs *tokenIds,
-                    const char *text) {
+/*
+
+mapped = "Ġworld"
+
+Symbol 0: "Ġ"   start=0, len=2
+Symbol 1: "w"   start=2, len=1
+Symbol 2: "o"   start=3, len=1
+Symbol 3: "r"   start=4, len=1
+Symbol 4: "l"   start=5, len=1
+Symbol 5: "d"   start=6, len=1
+
+*/
+
+struct BPESymbolList bpe_init_symbols(const char *mapped, size_t mapped_len) {
+    struct BPESymbolList result = {0};
+
+    // Upper bound: one symbol per byte.
+    result.items = malloc(mapped_len * sizeof(struct BPESymbol));
+
+    if(!result.items)
+        return result;
+
+    size_t i = 0;
+
+    while(i < mapped_len) {
+        unsigned char b = (unsigned char)mapped[i];
+
+        size_t len;
+
+        if(b < 0x80)
+            len = 1;
+        else if((b & 0xE0) == 0xC0)
+            len = 2;
+        else if((b & 0xF0) == 0xE0)
+            len = 3;
+        else if((b & 0xF8) == 0xF0)
+            len = 4;
+        else
+            goto fail;
+
+        if(len > mapped_len - i)
+            goto fail;
+
+        for(size_t j = 1; j < len; j++) {
+            if(((unsigned char)mapped[i + j] & 0xC0) != 0x80)
+                goto fail;
+        }
+
+        result.items[result.count++] = (struct BPESymbol){.start = i, .len = len};
+
+        i += len;
+    }
+
+    return result;
+
+fail:
+    free(result.items);
+    return (struct BPESymbolList){0};
+}
+
+static bool bpe_pair_matches(const char *mapped, struct BPESymbol left,
+                             struct BPESymbol right, const char *rule) {
+    // A merge rule is "left right".
+    const char *separator = strchr(rule, ' ');
+    if(!separator)
+        return false;
+
+    size_t left_len = (size_t)(separator - rule);
+    size_t right_len = strlen(separator + 1);
+
+    return left.len == left_len && right.len == right_len &&
+           memcmp(mapped + left.start, rule, left_len) == 0 &&
+           memcmp(mapped + right.start, separator + 1, right_len) == 0;
+}
+
+bool bpe_apply_merges(struct Qwen3Tokenizer *tokenizer, struct BPESymbolList *symbols,
+                      const char *mapped) {
+
+    if(!tokenizer || !symbols || !mapped)
+        return false;
+
+    while(symbols->count > 1) {
+        size_t best_rank = SIZE_MAX;
+        size_t best_index = SIZE_MAX;
+
+        // Examine every adjacent pair.
+        for(size_t i = 0; i + 1 < symbols->count; i++) {
+            struct BPESymbol left = symbols->items[i];
+            struct BPESymbol right = symbols->items[i + 1];
+
+            // Find the merge rule for this pair.
+            for(size_t rank = 0; rank < tokenizer->merge_count; rank++) {
+                if(rank >= best_rank)
+                    break;
+
+                if(bpe_pair_matches(mapped, left, right, tokenizer->merges[rank])) {
+                    best_rank = rank;
+                    best_index = i;
+                    break;
+                }
+            }
+        }
+
+        // No pair can be merged anymore.
+        if(best_index == SIZE_MAX)
+            break;
+
+        // Merge symbols[best_index] with the next symbol.
+        symbols->items[best_index].len += symbols->items[best_index + 1].len;
+
+        // Remove the second symbol by shifting the array left.
+        for(size_t j = best_index + 1; j + 1 < symbols->count; j++) {
+            symbols->items[j] = symbols->items[j + 1];
+        }
+
+        symbols->count--;
+    }
+
+    return true;
+}
+
+bool bpe_to_token_ids(struct Qwen3Tokenizer *tokenizer, struct BPESymbolList *symbols,
+                      const char *mapped, struct TokenIDs *tokenIds) {
+
+    if(!tokenizer || !symbols || !mapped || !tokenIds)
+        return false;
+
+    for(size_t i = 0; i < symbols->count; i++) {
+        struct BPESymbol symbol = symbols->items[i];
+
+        bool found = false;
+
+        for(size_t id = 0; id < tokenizer->vocab_size; id++) {
+            const char *token = tokenizer->vocab[id];
+
+            if(strlen(token) == symbol.len &&
+               memcmp(token, mapped + symbol.start, symbol.len) == 0) {
+
+                // Assumes tokenIds->items has sufficient capacity.
+                tokenIds->items[tokenIds->count++] = (uint32_t)id;
+
+                found = true;
+                break;
+            }
+        }
+
+        if(!found)
+            return false;
+    }
+
+    return true;
+}
+
+/*
+
+
+*/
+
+void bytes_to_unicode(uint32_t table[256]) {
+    // Step 1: Keep printable bytes unchanged.
+    for(int b = 33; b <= 126; b++)
+        table[b] = b;
+
+    for(int b = 161; b <= 172; b++)
+        table[b] = b;
+
+    for(int b = 174; b <= 255; b++)
+        table[b] = b;
+
+    // Step 2: Map all remaining bytes to code points >= 256.
+    uint32_t next = 256;
+
+    for(int b = 0; b < 256; b++) {
+        bool printable =
+            (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+
+        if(!printable) {
+            table[b] = next++;
+        }
+    }
+}
+
+// icl, chatgpt gave me this code lmao
+static int encode_utf8(uint32_t cp, char *out) {
+    if(cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+}
+
+bool qwen3_tokenize(struct Qwen3Tokenizer *tokenizer, struct ChunkList *chunks,
+                    struct TokenIDs *tokenIds, const char *text) {
 
     if(!chunks || !tokenIds || !text)
         return false;
 
-    if(chunks->count == 0 || tokenIds->count == 0)
-        return false;
-
-    if(chunks->count != tokenIds->count)
-        return false;
+    uint32_t table[256];
+    bytes_to_unicode(table);
 
     // 1. Enable the system's default locale (required for proper UTF-8 interpretation)
     setlocale(LC_ALL, "");
@@ -831,38 +1027,48 @@ bool qwen3_tokenize(struct ChunkList *chunks, struct TokenIDs *tokenIds,
     for(size_t i = 0; i < chunks->count; i++) {
 
         c = chunks->items[i];
-        const char *utf8_bytes = text + c.start;
 
-        // Create a byte array for the chunk from the text input
-        char *chunk_bytes = malloc(c.len + 1);
-        if(!chunk_bytes) {
+        const unsigned char *bytes = (const unsigned char *)text + c.start;
+
+        char *mapped = malloc(c.len * 2 + 1);
+        if(!mapped)
+            return false;
+
+        size_t mapped_len = 0;
+
+        for(size_t j = 0; j < c.len; j++) {
+            uint8_t b = bytes[j];
+
+            // Original byte -> Unicode code point
+            uint32_t cp = table[b];
+
+            // Unicode code point -> UTF-8 bytes
+            mapped_len += encode_utf8(cp, mapped + mapped_len);
+        }
+
+        mapped[mapped_len] = '\0';
+
+        struct BPESymbolList symbols = bpe_init_symbols(mapped, mapped_len);
+
+        if(!symbols.items && mapped_len != 0) {
+            free(mapped);
             return false;
         }
 
-        memcpy(chunk_bytes, utf8_bytes, c.len);
-        chunk_bytes[c.len] = '\0'; // Manually null terminate the narrow string chunk
-
-        // Determine the size needed for the wide-character buffer
-        size_t num_chars = mbstowcs(NULL, chunk_bytes, 0);
-        if(num_chars == (size_t)-1) {
-            perror("Invalid multibyte sequence encountered");
+        if(!bpe_apply_merges(tokenizer, &symbols, mapped)) {
+            free(symbols.items);
+            free(mapped);
             return false;
         }
 
-        // Allocate memory for the Unicode string (no null termination)
-        wchar_t *unicode_string = malloc((num_chars + 1) * sizeof(wchar_t));
-        if(!unicode_string)
+        if(!bpe_to_token_ids(tokenizer, &symbols, mapped, tokenIds)) {
+            free(symbols.items);
+            free(mapped);
             return false;
+        }
 
-        // perform the actual conversion
-        mbstowcs(unicode_string, chunk_bytes, num_chars + 1);
-
-        printf("%d\n", (int)num_chars);
-        printf("Converted string: %ls\n", unicode_string);
-        printf("Number of Unicode characters: %zu\n", num_chars);
-
-        free(unicode_string);
-        free(chunk_bytes);
+        free(symbols.items);
+        free(mapped);
     }
 
     return true;
@@ -969,34 +1175,35 @@ int main(int argc, char **argv) {
     printf(" Tokenizer merge count: %llu\n", (unsigned long long)tokenizer.merge_count);
 
     // make use of qwen3_tokenize here for an example string
-    const char *example_text = "Hello world! I'm learning C in 2026.";
-    struct ChunkList chunks = qwen2_pre_tokenize(example_text, strlen(example_text));
+    const char *input_text = "Hello world! I'm learning C in 2026.";
+    size_t text_len = strlen(input_text);
+    struct ChunkList chunks = qwen2_pre_tokenize(input_text, strlen(input_text));
 
-    if(chunks.count == 0) {
-        fprintf(stderr, "Failed to pre-tokenize example text\n");
-    } else {
-        struct TokenIDs token_ids;
-        token_ids.count = chunks.count;
-        token_ids.items = malloc(token_ids.count * sizeof(uint32_t));
-        if(!token_ids.items) {
-            fprintf(stderr, "Failed to allocate token IDs\n");
-        } else {
-            // for demonstration, assign dummy token IDs (e.g., index values)
-            for(size_t i = 0; i < token_ids.count; i++) {
-                token_ids.items[i] = (uint32_t)i;
-            }
+    struct TokenIDs token_ids = {0};
+    token_ids.items = malloc(text_len * sizeof(uint32_t));
 
-            if(!qwen3_tokenize(&chunks, &token_ids, example_text)) {
-                fprintf(stderr, "Tokenization failed\n");
-            }
-
-            free(token_ids.items);
-        }
+    if(!token_ids.items) {
+        fprintf(stderr, "Failed to allocate token IDs\n");
+        free(chunks.items);
+        return 1;
     }
 
-    free(chunks.items);
+    if(!qwen3_tokenize(&tokenizer, &chunks, &token_ids, input_text)) {
+        fprintf(stderr, "Tokenization failed\n");
+        free(token_ids.items);
+        free(chunks.items);
+        return 1;
+    }
+
+    printf("Token IDs: ");
+    for(size_t i = 0; i < token_ids.count; i++) {
+        printf("%u ", token_ids.items[i]);
+    }
+    printf("\n");
 
     // NOTE: free pointers
+    free(token_ids.items);
+    free(chunks.items);
 
     for(uint64_t i = 0; i < header.tensor_count; i++)
         free(infos[i].name);
