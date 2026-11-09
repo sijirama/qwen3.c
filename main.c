@@ -120,9 +120,44 @@ Then:
 */
 
 typedef struct {
-    __fp16 scale;  // FP16 scale: 2 bytes
+    uint16_t scale;  // FP16 scale: 2 bytes
     int8_t qs[32];   // 32 quantized weights
 } block_q8_0;
+
+
+// INFO: got this code from chatgpt
+// portable IEEE FP16-to-FP32 decoder
+
+static inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t frac = h & 0x03FFu;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (frac == 0) {
+            bits = sign;
+        } else {
+            int32_t e = -14;
+
+            while ((frac & 0x0400u) == 0) {
+                frac <<= 1;
+                e--;
+            }
+
+            frac &= 0x03FFu;
+            bits = sign | ((uint32_t)(e + 127) << 23) | (frac << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (frac << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (frac << 13);
+    }
+
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
 
 // ============================================================
 // GGUF MODEL FILE PARSER
@@ -1128,7 +1163,7 @@ bool embed_lookup_scalar_Q8_0 (
 
         for (size_t block_idx = 0; block_idx < n_blocks; block_idx++) {
             const block_q8_0* block = &blocks[block_idx];
-            float scale = (__fp16)block->scale;
+            float scale = fp16_to_fp32(block->scale);
 
             size_t base_idx = i * hidden_size + block_idx * 32;
             size_t limit = (block_idx == n_blocks - 1) ? (hidden_size - block_idx * 32) : 32;
@@ -1317,6 +1352,8 @@ int main(int argc, char** argv) {
         perror("fopen");
         return 1;
     }
+
+    _Static_assert(sizeof(block_q8_0) == 34, "Invalid Q8_0 block size");
 
     struct GGUFHeader header;
 
