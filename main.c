@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define PCRE2_CODE_UNIT_WIDTH 8
+#include <math.h>
+#include <stddef.h>
 #include <locale.h>
 #include <pcre2.h>
 #include <stdbool.h>
@@ -118,7 +120,7 @@ Then:
 */
 
 typedef struct {
-    _Float16 scale;  // FP16 scale: 2 bytes
+    __fp16 scale;  // FP16 scale: 2 bytes
     int8_t qs[32];   // 32 quantized weights
 } block_q8_0;
 
@@ -141,6 +143,25 @@ enum GGUF_TYPE {
     GGUF_TYPE_INT64 = 11,
     GGUF_TYPE_FLOAT64 = 12
 };
+
+void print_tensor_metadata(const struct Tensor* tensor) {
+    if (!tensor) {
+        printf("Tensor is NULL\n");
+        return;
+    }
+
+    printf("Tensor metadata:\n");
+    printf("  Number of dimensions: %d\n", tensor->ndim);
+    printf("  Shape: [");
+    for (int i = 0; i < tensor->ndim; i++) {
+        printf("%" PRId64, tensor->shape[i]);
+        if (i < tensor->ndim - 1) {
+            printf(", ");
+        }
+    }
+    printf("]\n");
+    printf("  Data type: %d\n", tensor->type);
+}
 
 // read exactly n bytes from the file into dst.
 static bool gguf_read(FILE* file, void* dst, size_t n) {
@@ -575,6 +596,7 @@ bool qwen3_map_file(const char* path, struct GGUFTensorInfo* infos,
 
         if(strcmp(name, "token_embd.weight") == 0) {
             model->token_embedding = tensor;
+            print_tensor_metadata(&tensor);
             found_token_embedding = true;
             continue;
         }
@@ -1052,24 +1074,133 @@ bool qwen3_tokenize(struct Qwen3Tokenizer* tokenizer, struct ChunkList* chunks,
 // KERNELS
 // ============================================================
 
+inline bool dot(float * a, float * b, float * c, size_t n){
+    float sum = 0.0f;
+
+    for (size_t i = 0; i < n; i++) {
+        sum += a[i] * b[i];
+    }
+
+    *c = sum;
+    return true;
+}
+
+inline bool mulvec(float * a, float * b, float * c, size_t n){
+    for (size_t i = 0; i < n; i++) {
+        c[i] = a[i] * b[i];
+    }
+    return true;
+}
+
+// work for an F32 embedding, but not for the Q8_0 model.
+bool embed_lookup_scalar_FP32 (
+    const uint32_t* token_ids, 
+    const float* embedding, 
+    float*output, 
+    size_t n_tokens, 
+    size_t hidden_size){
+
+    for (size_t i = 0 ; i < n_tokens; i++) {
+        uint32_t token_id = token_ids[i];
+        float * row_start = (float *)embedding + (token_id * hidden_size);
+        memcpy(output + i * hidden_size, row_start, hidden_size * sizeof(float));
+    }
+
+    return true;
+}
+
+bool embed_lookup_scalar_Q8_0 (
+    const uint32_t* token_ids, 
+    const float* embedding, 
+    float*output, 
+    size_t n_tokens, 
+    size_t hidden_size){
+
+    // n blocks for q8_0 because there are 32 weights in a block
+    size_t n_blocks = (hidden_size + 31) / 32;
+
+    for (size_t i = 0; i < n_tokens; i++) {
+        uint32_t token_id = token_ids[i];
+        const block_q8_0* blocks = (void *)embedding + token_id * n_blocks;
+
+        for (size_t block_idx = 0; block_idx < n_blocks; block_idx++) {
+            const block_q8_0* block = &blocks[block_idx];
+            float scale = (__fp16)block->scale;
+
+            size_t base_idx = i * hidden_size + block_idx * 32;
+            size_t limit = (block_idx == n_blocks - 1) ? (hidden_size - block_idx * 32) : 32;
+
+            for (size_t j = 0; j < limit; j++) {
+                output[base_idx + j] = scale * (float)block->qs[j];
+            }
+        }
+    }
+
+    return true;
+}
+
+
+
+bool rmsnorm_scalar(
+    const float *input,
+    const float *gamma,
+    float *output,
+    size_t n_tokens,
+    size_t hidden_size,
+    float eps
+) {
+    if (!input || !gamma || !output || hidden_size == 0)
+        return false;
+
+    for (size_t i = 0; i < n_tokens; i++) {
+        const float *row = input + i * hidden_size;
+        float *out = output + i * hidden_size;
+
+        float sum_sq = 0.0f;
+
+        for (size_t j = 0; j < hidden_size; j++) {
+            sum_sq += row[j] * row[j];
+        }
+
+        float inv_rms = 1.0f / sqrtf(sum_sq / hidden_size + eps);
+
+        for (size_t j = 0; j < hidden_size; j++) {
+            out[j] = row[j] * inv_rms * gamma[j];
+        }
+    }
+    return true;
+}
+
 // ============================================================
 // FORWARD
 // ============================================================
 
 bool embedding_lookup(const struct Tensor* embedding, const uint32_t* token_ids,
                       size_t n_tokens, size_t hidden_size, float* output){
-    return true;
+
+    if (!token_ids || !embedding || !output || n_tokens == 0 || hidden_size == 0) {
+        return false;
+    }
+
+        switch (embedding->type) {
+        case 8:
+            return embed_lookup_scalar_Q8_0(token_ids, embedding->data, output, n_tokens, hidden_size);
+        default:
+            return embed_lookup_scalar_FP32(token_ids, embedding->data, output, n_tokens, hidden_size);
+        }
 }
 
 bool rms_norm(const struct Tensor* gamma, const float* input, float* output,
               size_t n_tokens, size_t hidden_size, float eps) {
 
-    // rmsnorm_avx2(
-    //     input, gamma, output,
-    //     n_tokens, hidden_size, eps
-    // );
+    // input  is [n_tokens, hidden_size]
+    // gamaa is            [hidden_size]
+    // output is [n_tokens, hidden_size]
 
-    return true;
+    return rmsnorm_scalar(
+        input, gamma->data, output,
+        n_tokens, hidden_size, eps
+    );
 }
 
 /*
@@ -1123,6 +1254,7 @@ bool qwen3_forward(struct Qwen3Model* model, const uint32_t* token_ids, size_t n
 
     float rms_norm_eps = model->config.rms_norm_eps;
 
+    // 2. all attention layers ran
     for(size_t i = 0; i < model->config.num_layers; i++) {
 
         struct Qwen3Layer* layer = &model->layers[i];

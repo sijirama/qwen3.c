@@ -1,5 +1,5 @@
 CC = clang
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -lpcre2-8
+CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -lpcre2-8 -lm
 
 TARGET = qwen3
 TEST_TARGET = test_qwen3
