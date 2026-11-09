@@ -1,11 +1,13 @@
 Language: Cpp
-BasedOnStyle: LLVM
+BasedOnStyle: Google
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never
 ColumnLimit: 90
 BreakBeforeBraces: Attach
 SpaceBeforeParens: Never
-AllowShortFunctionsOnASingleLine: Empty
-AllowShortIfStatementsOnASingleLine: false
-AllowShortLoopsOnASingleLine: false
+# AllowShortFunctionsOnASingleLine: Empty
+# AllowShortIfStatementsOnASingleLine: false
+# AllowShortLoopsOnASingleLine: false
+AlignAfterOpenBracket: true
+AlignFunctionDeclarations: true
