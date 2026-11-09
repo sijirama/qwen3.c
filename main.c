@@ -1095,7 +1095,7 @@ inline bool mulvec(float * a, float * b, float * c, size_t n){
 // work for an F32 embedding, but not for the Q8_0 model.
 bool embed_lookup_scalar_FP32 (
     const uint32_t* token_ids, 
-    const float* embedding, 
+    const void* embedding, 
     float*output, 
     size_t n_tokens, 
     size_t hidden_size){
@@ -1111,17 +1111,20 @@ bool embed_lookup_scalar_FP32 (
 
 bool embed_lookup_scalar_Q8_0 (
     const uint32_t* token_ids, 
-    const float* embedding, 
+    const void* embedding, 
     float*output, 
     size_t n_tokens, 
     size_t hidden_size){
 
+    if (hidden_size % 32 != 0)
+        return false;
+
     // n blocks for q8_0 because there are 32 weights in a block
-    size_t n_blocks = (hidden_size + 31) / 32;
+    size_t n_blocks = hidden_size / 32;
 
     for (size_t i = 0; i < n_tokens; i++) {
         uint32_t token_id = token_ids[i];
-        const block_q8_0* blocks = (void *)embedding + token_id * n_blocks;
+        const block_q8_0* blocks = (const block_q8_0 *)embedding + token_id * n_blocks;
 
         for (size_t block_idx = 0; block_idx < n_blocks; block_idx++) {
             const block_q8_0* block = &blocks[block_idx];
@@ -1183,10 +1186,12 @@ bool embedding_lookup(const struct Tensor* embedding, const uint32_t* token_ids,
     }
 
         switch (embedding->type) {
+        case 0:
+            return embed_lookup_scalar_FP32(token_ids, embedding->data, output, n_tokens, hidden_size);
         case 8:
             return embed_lookup_scalar_Q8_0(token_ids, embedding->data, output, n_tokens, hidden_size);
         default:
-            return embed_lookup_scalar_FP32(token_ids, embedding->data, output, n_tokens, hidden_size);
+            return false;
         }
 }
 
@@ -1196,6 +1201,9 @@ bool rms_norm(const struct Tensor* gamma, const float* input, float* output,
     // input  is [n_tokens, hidden_size]
     // gamaa is            [hidden_size]
     // output is [n_tokens, hidden_size]
+
+    if (!gamma || !gamma->data || !input || !output)
+        return false;
 
     return rmsnorm_scalar(
         input, gamma->data, output,
