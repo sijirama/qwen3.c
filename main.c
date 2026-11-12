@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define PCRE2_CODE_UNIT_WIDTH 8
+#include <inttypes.h>
 #include <math.h>
 #include <stddef.h>
 #include <locale.h>
@@ -1127,7 +1128,6 @@ inline bool mulvec(float * a, float * b, float * c, size_t n){
     return true;
 }
 
-// work for an F32 embedding, but not for the Q8_0 model.
 bool embed_lookup_scalar_FP32 (
     const uint32_t* token_ids, 
     const void* embedding, 
@@ -1177,8 +1177,6 @@ bool embed_lookup_scalar_Q8_0 (
     return true;
 }
 
-
-
 bool rmsnorm_scalar(
     const float *input,
     const float *gamma,
@@ -1216,18 +1214,27 @@ bool rmsnorm_scalar(
 bool embedding_lookup(const struct Tensor* embedding, const uint32_t* token_ids,
                       size_t n_tokens, size_t hidden_size, float* output){
 
-    if (!token_ids || !embedding || !output || n_tokens == 0 || hidden_size == 0) {
+    if(!token_ids || !embedding || !embedding->data || !output || n_tokens == 0 ||
+       hidden_size == 0 || embedding->ndim != 2 || embedding->shape[0] != (int64_t)hidden_size ||
+       embedding->shape[1] <= 0) {
         return false;
     }
 
-        switch (embedding->type) {
+    // GGUF stores this matrix as [hidden_size, vocab_size], while each
+    // lookup row is laid out as hidden_size values for one token.
+    for(size_t i = 0; i < n_tokens; i++) {
+        if((uint64_t)token_ids[i] >= (uint64_t)embedding->shape[1])
+            return false;
+    }
+
+    switch (embedding->type) {
         case 0:
             return embed_lookup_scalar_FP32(token_ids, embedding->data, output, n_tokens, hidden_size);
         case 8:
             return embed_lookup_scalar_Q8_0(token_ids, embedding->data, output, n_tokens, hidden_size);
         default:
             return false;
-        }
+    }
 }
 
 bool rms_norm(const struct Tensor* gamma, const float* input, float* output,
@@ -1237,13 +1244,27 @@ bool rms_norm(const struct Tensor* gamma, const float* input, float* output,
     // gamaa is            [hidden_size]
     // output is [n_tokens, hidden_size]
 
-    if (!gamma || !gamma->data || !input || !output)
+    if(!gamma || !gamma->data || !input || !output || gamma->type != 0 ||
+       gamma->ndim != 1 || gamma->shape[0] != (int64_t)hidden_size)
         return false;
 
     return rmsnorm_scalar(
         input, gamma->data, output,
         n_tokens, hidden_size, eps
     );
+}
+
+bool attention(const struct Qwen3Layer* layer, const struct Qwen3Config* config,
+               const float* input, float* output, size_t n_tokens) {
+    (void)layer;
+    (void)config;
+    (void)input;
+    (void)output;
+    (void)n_tokens;
+
+    // input shape - [n_tokens, 1024] 
+    
+    return true;
 }
 
 /*
@@ -1283,10 +1304,12 @@ bool qwen3_forward(struct Qwen3Model* model, const uint32_t* token_ids, size_t n
 
     float* hidden = malloc(num_values * sizeof(float));
     float* normed = malloc(num_values * sizeof(float));
+    float* scratch = malloc(num_values * sizeof(float));
 
-    if(!hidden || !normed) {
+    if(!hidden || !normed || !scratch) {
         free(hidden);
         free(normed);
+        free(scratch);
         return false;
     }
 
@@ -1302,10 +1325,15 @@ bool qwen3_forward(struct Qwen3Model* model, const uint32_t* token_ids, size_t n
 
         struct Qwen3Layer* layer = &model->layers[i];
 
-        // attn_rms_norm (qwen architecture employs pre-norm)
-        rms_norm(&layer->attn_norm, hidden, normed, n_tokens, hidden_size, rms_norm_eps);
+        if (!rms_norm(&layer->attn_norm, hidden, normed,
+                      n_tokens, hidden_size, rms_norm_eps))
+            goto cleanup;
 
-        // attention(...)
+        if(!attention(layer, &model->config, normed, scratch, n_tokens))
+            goto cleanup;
+
+        // residual_add(hidden, scratch, num_values);
+
         // mlp(...)
         // residual connections
     }
@@ -1315,11 +1343,13 @@ bool qwen3_forward(struct Qwen3Model* model, const uint32_t* token_ids, size_t n
 
     free(hidden);
     free(normed);
+    free(scratch);
     return true;
 
 cleanup:
     free(hidden);
     free(normed);
+    free(scratch);
     return false;
 }
 
